@@ -9,6 +9,7 @@ Engine URL is read from $VOICEVOX_ENGINE_URL (default http://127.0.0.1:50021).
 The engine itself is out of scope for this server — point it at any running
 VOICEVOX engine, local or remote.
 """
+
 from __future__ import annotations
 
 import os
@@ -47,9 +48,7 @@ def voicevox_list_speakers() -> dict[str, list[dict[str, Any]]]:
         response.raise_for_status()
         speakers = response.json()
     return {
-        s["name"]: [
-            {"style_name": st["name"], "style_id": st["id"]} for st in s["styles"]
-        ]
+        s["name"]: [{"style_name": st["name"], "style_id": st["id"]} for st in s["styles"]]
         for s in speakers
     }
 
@@ -71,9 +70,7 @@ def voicevox_synthesize(
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with _client() as client:
-        query = client.post(
-            "/audio_query", params={"text": text, "speaker": speaker_id}
-        )
+        query = client.post("/audio_query", params={"text": text, "speaker": speaker_id})
         query.raise_for_status()
         synth = client.post(
             "/synthesis",
