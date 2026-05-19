@@ -3,6 +3,7 @@
 The actual /audio_query and /synthesis pipelines require a running engine,
 so they're not exercised here — see README for end-to-end verification.
 """
+
 from __future__ import annotations
 
 import importlib
