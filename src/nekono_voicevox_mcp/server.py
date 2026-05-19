@@ -1,9 +1,11 @@
 """nekono-voicevox-mcp: MCP server for VOICEVOX engine HTTP API.
 
-Tools (MVP):
+Tools:
 - voicevox_list_speakers() — `/speakers`, name keyed dict of style ids
 - voicevox_synthesize(text, speaker_id, output_path, **overrides) — wav file output
 - voicevox_play(text, speaker_id, **overrides) — pipe through pw-cat to local PipeWire
+- voicevox_synthesize_multi(segments, output_path) — multi-speaker / silence
+  concatenated WAV in one call (= ffmpeg-less alternative for narration)
 
 Engine URL is read from $VOICEVOX_ENGINE_URL (default http://127.0.0.1:50021).
 The engine itself is out of scope for this server — point it at any running
@@ -12,10 +14,12 @@ VOICEVOX engine, local or remote.
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +29,14 @@ from fastmcp import FastMCP
 DEFAULT_ENGINE_URL = "http://127.0.0.1:50021"
 ENGINE_URL = os.environ.get("VOICEVOX_ENGINE_URL", DEFAULT_ENGINE_URL)
 PW_CAT = shutil.which("pw-cat") or "/usr/bin/pw-cat"
+
+# VOICEVOX engine の wav output 仕様 (= 0.14+ 時点で固定)。 multi-segment
+# concat はこの format 一致前提で raw frames 連結する。 mismatch 検知は
+# _wav_frames() の中で raise する (= 将来 engine が 48kHz/stereo 返した時
+# に silent corruption でなく明示 error にする)。
+_SAMPLE_RATE = 24000
+_CHANNELS = 1
+_SAMPLE_WIDTH = 2  # bytes (= 16-bit PCM)
 
 # Mapping from this server's snake_case override names to VOICEVOX engine
 # AudioQuery JSON camelCase fields. Issue #5 注文① — exposed so callers can
@@ -235,6 +247,100 @@ def voicevox_play(
     finally:
         tmp_path.unlink(missing_ok=True)
     return {"played": True}
+
+
+def _silence_frames(seconds: float) -> bytes:
+    """Generate zero-fill PCM frames at the engine's native format."""
+    if seconds < 0:
+        raise ValueError(f"silence_seconds must be >= 0 (got {seconds})")
+    return b"\x00" * int(seconds * _SAMPLE_RATE * _CHANNELS * _SAMPLE_WIDTH)
+
+
+def _wav_frames(wav_bytes: bytes) -> bytes:
+    """Extract raw PCM frames from a WAV blob, asserting the engine's format.
+
+    Raises ValueError if the WAV's frame rate / channels / sample width
+    differ from the expected 24kHz / mono / 16-bit. This prevents silent
+    corruption if a future engine release changes its output format.
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        fr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        if (fr, ch, sw) != (_SAMPLE_RATE, _CHANNELS, _SAMPLE_WIDTH):
+            raise ValueError(
+                f"unexpected wav format: {fr}Hz/{ch}ch/{sw * 8}bit "
+                f"(want {_SAMPLE_RATE}Hz/{_CHANNELS}ch/{_SAMPLE_WIDTH * 8}bit)"
+            )
+        return w.readframes(w.getnframes())
+
+
+def _synthesize_multi_impl(segments: list[dict[str, Any]], output_path: str) -> dict[str, Any]:
+    """Internal implementation, callable from tests without FastMCP wrapping.
+
+    See voicevox_synthesize_multi() docstring for the contract.
+    """
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    frames_chunks: list[bytes] = []
+    voiced_count = 0
+    silence_count = 0
+    for i, seg in enumerate(segments):
+        if "silence_seconds" in seg:
+            frames_chunks.append(_silence_frames(seg["silence_seconds"]))
+            silence_count += 1
+        elif "text" in seg and "speaker_id" in seg:
+            overrides = {k: seg.get(k) for k in _QUERY_OVERRIDE_FIELDS if k in seg}
+            wav = _synthesize_to_bytes(seg["text"], seg["speaker_id"], **overrides)
+            frames_chunks.append(_wav_frames(wav))
+            voiced_count += 1
+        else:
+            raise ValueError(
+                f"segment {i}: must have either 'silence_seconds' or both 'text' and 'speaker_id'"
+            )
+
+    with wave.open(str(output), "wb") as out:
+        out.setnchannels(_CHANNELS)
+        out.setsampwidth(_SAMPLE_WIDTH)
+        out.setframerate(_SAMPLE_RATE)
+        for chunk in frames_chunks:
+            out.writeframes(chunk)
+
+    return {
+        "output_path": str(output),
+        "size_bytes": output.stat().st_size,
+        "segment_count": len(segments),
+        "voiced_count": voiced_count,
+        "silence_count": silence_count,
+    }
+
+
+@mcp.tool
+def voicevox_synthesize_multi(
+    segments: list[dict[str, Any]],
+    output_path: str,
+) -> dict[str, Any]:
+    """Synthesize multiple segments and concatenate into a single WAV file.
+
+    Each segment is one of:
+    - voiced: {"text": str, "speaker_id": int, ...override kwargs}
+    - silence: {"silence_seconds": float}
+
+    Voiced segments go through /audio_query + /synthesis with per-segment
+    AudioQuery overrides (same keys as voicevox_synthesize — see that tool's
+    docstring). Silence segments are zero-fill PCM at the engine's native
+    24kHz / mono / 16-bit format. All frames are concatenated into a single
+    WAV at output_path.
+
+    Use this in place of a manual ffmpeg + concat-list workflow for
+    multi-speaker narration or paragraph reading; one call produces the
+    final file. Total wall time = sum of per-segment engine round-trips, so
+    very long documents may exceed the MCP client's timeout — split into
+    multiple calls if needed.
+
+    Raises ValueError if any segment is malformed, or if the engine returns
+    a WAV in an unexpected sample format (= future-proofing tripwire).
+    """
+    return _synthesize_multi_impl(segments, output_path)
 
 
 def main() -> None:
