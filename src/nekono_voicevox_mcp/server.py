@@ -1,9 +1,16 @@
 """nekono-voicevox-mcp: MCP server for VOICEVOX engine HTTP API.
 
-Tools (MVP):
+Tools:
 - voicevox_list_speakers() — `/speakers`, name keyed dict of style ids
 - voicevox_synthesize(text, speaker_id, output_path, **overrides) — wav file output
 - voicevox_play(text, speaker_id, **overrides) — pipe through pw-cat to local PipeWire
+- voicevox_synthesize_multi(segments, output_path) — multi-speaker / silence
+  concatenated WAV in one call (= ffmpeg-less alternative for narration)
+- voicevox_audio_query(text, speaker_id) + voicevox_synthesize_from_query(
+  query, speaker_id, output_path) — low-level pair for editing the
+  AudioQuery JSON (= accent_phrases, mora-level pitches) before render
+- voicevox_dict_{list,add,remove}() — /user_dict CRUD for persistent
+  pronunciation overrides
 
 Engine URL is read from $VOICEVOX_ENGINE_URL (default http://127.0.0.1:50021).
 The engine itself is out of scope for this server — point it at any running
@@ -12,10 +19,12 @@ VOICEVOX engine, local or remote.
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +34,14 @@ from fastmcp import FastMCP
 DEFAULT_ENGINE_URL = "http://127.0.0.1:50021"
 ENGINE_URL = os.environ.get("VOICEVOX_ENGINE_URL", DEFAULT_ENGINE_URL)
 PW_CAT = shutil.which("pw-cat") or "/usr/bin/pw-cat"
+
+# VOICEVOX engine の wav output 仕様 (= 0.14+ 時点で固定)。 multi-segment
+# concat はこの format 一致前提で raw frames 連結する。 mismatch 検知は
+# _wav_frames() の中で raise する (= 将来 engine が 48kHz/stereo 返した時
+# に silent corruption でなく明示 error にする)。
+_SAMPLE_RATE = 24000
+_CHANNELS = 1
+_SAMPLE_WIDTH = 2  # bytes (= 16-bit PCM)
 
 # Mapping from this server's snake_case override names to VOICEVOX engine
 # AudioQuery JSON camelCase fields. Issue #5 注文① — exposed so callers can
@@ -235,6 +252,215 @@ def voicevox_play(
     finally:
         tmp_path.unlink(missing_ok=True)
     return {"played": True}
+
+
+def _silence_frames(seconds: float) -> bytes:
+    """Generate zero-fill PCM frames at the engine's native format."""
+    if seconds < 0:
+        raise ValueError(f"silence_seconds must be >= 0 (got {seconds})")
+    return b"\x00" * int(seconds * _SAMPLE_RATE * _CHANNELS * _SAMPLE_WIDTH)
+
+
+def _wav_frames(wav_bytes: bytes) -> bytes:
+    """Extract raw PCM frames from a WAV blob, asserting the engine's format.
+
+    Raises ValueError if the WAV's frame rate / channels / sample width
+    differ from the expected 24kHz / mono / 16-bit. This prevents silent
+    corruption if a future engine release changes its output format.
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        fr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        if (fr, ch, sw) != (_SAMPLE_RATE, _CHANNELS, _SAMPLE_WIDTH):
+            raise ValueError(
+                f"unexpected wav format: {fr}Hz/{ch}ch/{sw * 8}bit "
+                f"(want {_SAMPLE_RATE}Hz/{_CHANNELS}ch/{_SAMPLE_WIDTH * 8}bit)"
+            )
+        return w.readframes(w.getnframes())
+
+
+def _synthesize_multi_impl(segments: list[dict[str, Any]], output_path: str) -> dict[str, Any]:
+    """Internal implementation, callable from tests without FastMCP wrapping.
+
+    See voicevox_synthesize_multi() docstring for the contract.
+    """
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    frames_chunks: list[bytes] = []
+    voiced_count = 0
+    silence_count = 0
+    for i, seg in enumerate(segments):
+        if "silence_seconds" in seg:
+            frames_chunks.append(_silence_frames(seg["silence_seconds"]))
+            silence_count += 1
+        elif "text" in seg and "speaker_id" in seg:
+            overrides = {k: seg.get(k) for k in _QUERY_OVERRIDE_FIELDS if k in seg}
+            wav = _synthesize_to_bytes(seg["text"], seg["speaker_id"], **overrides)
+            frames_chunks.append(_wav_frames(wav))
+            voiced_count += 1
+        else:
+            raise ValueError(
+                f"segment {i}: must have either 'silence_seconds' or both 'text' and 'speaker_id'"
+            )
+
+    with wave.open(str(output), "wb") as out:
+        out.setnchannels(_CHANNELS)
+        out.setsampwidth(_SAMPLE_WIDTH)
+        out.setframerate(_SAMPLE_RATE)
+        for chunk in frames_chunks:
+            out.writeframes(chunk)
+
+    return {
+        "output_path": str(output),
+        "size_bytes": output.stat().st_size,
+        "segment_count": len(segments),
+        "voiced_count": voiced_count,
+        "silence_count": silence_count,
+    }
+
+
+@mcp.tool
+def voicevox_synthesize_multi(
+    segments: list[dict[str, Any]],
+    output_path: str,
+) -> dict[str, Any]:
+    """Synthesize multiple segments and concatenate into a single WAV file.
+
+    Each segment is one of:
+    - voiced: {"text": str, "speaker_id": int, ...override kwargs}
+    - silence: {"silence_seconds": float}
+
+    Voiced segments go through /audio_query + /synthesis with per-segment
+    AudioQuery overrides (same keys as voicevox_synthesize — see that tool's
+    docstring). Silence segments are zero-fill PCM at the engine's native
+    24kHz / mono / 16-bit format. All frames are concatenated into a single
+    WAV at output_path.
+
+    Use this in place of a manual ffmpeg + concat-list workflow for
+    multi-speaker narration or paragraph reading; one call produces the
+    final file. Total wall time = sum of per-segment engine round-trips, so
+    very long documents may exceed the MCP client's timeout — split into
+    multiple calls if needed.
+
+    Raises ValueError if any segment is malformed, or if the engine returns
+    a WAV in an unexpected sample format (= future-proofing tripwire).
+    """
+    return _synthesize_multi_impl(segments, output_path)
+
+
+# ---------------------------------------------------------------------------
+# Issue #5 注文③ — low-level AudioQuery split
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def voicevox_audio_query(text: str, speaker_id: int) -> dict[str, Any]:
+    """Get the raw AudioQuery JSON from the engine.
+
+    Returns the engine's full /audio_query response so the caller can edit
+    it before synthesis (e.g. tweak `accent_phrases[].pause_mora`, inject
+    a `kana` reading, etc.). Pass the (possibly edited) dict back to
+    voicevox_synthesize_from_query() to render the WAV.
+
+    Prefer voicevox_synthesize() for the common case; this pair is for
+    advanced control.
+    """
+    with _client() as client:
+        response = client.post("/audio_query", params={"text": text, "speaker": speaker_id})
+        response.raise_for_status()
+        return response.json()
+
+
+@mcp.tool
+def voicevox_synthesize_from_query(
+    query: dict[str, Any], speaker_id: int, output_path: str
+) -> dict[str, Any]:
+    """Render an AudioQuery dict to a WAV file via /synthesis.
+
+    Pair with voicevox_audio_query(): get the query, edit it, then pass it
+    here. Bypasses /audio_query so any custom edits to accent_phrases /
+    kana / etc. survive.
+    """
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with _client() as client:
+        synth = client.post(
+            "/synthesis",
+            params={"speaker": speaker_id},
+            json=query,
+            headers={"Accept": "audio/wav", "Content-Type": "application/json"},
+        )
+        synth.raise_for_status()
+    output.write_bytes(synth.content)
+    return {"output_path": str(output), "size_bytes": output.stat().st_size}
+
+
+# ---------------------------------------------------------------------------
+# Issue #5 注文④ — user dictionary management
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def voicevox_dict_list() -> dict[str, dict[str, Any]]:
+    """List all user dictionary entries (/user_dict GET).
+
+    Returns: {word_uuid: {surface, pronunciation, accent_type, ...}}
+
+    Use this to find a word_uuid for voicevox_dict_remove(), or to audit
+    what entries are already registered.
+    """
+    with _client() as client:
+        response = client.get("/user_dict")
+        response.raise_for_status()
+        return response.json()
+
+
+@mcp.tool(annotations={"destructiveHint": True})
+def voicevox_dict_add(
+    surface: str,
+    pronunciation: str,
+    accent_type: int,
+    word_type: str | None = None,
+    priority: int | None = None,
+) -> dict[str, str]:
+    """Add a word to the user dictionary (/user_dict_word POST).
+
+    - surface: 表記 (e.g. "解する")
+    - pronunciation: カナの読み (e.g. "カイスル"、 全角カタカナ)
+    - accent_type: アクセント核の mora 位置 (0-indexed、 0 = 平板)
+    - word_type: optional engine word category (default = engine's own default)
+    - priority: optional priority (1-10、 high = better match)
+
+    Saves the engine-assigned word_uuid in the returned dict so the caller
+    can pass it to voicevox_dict_remove() later. The engine persists user
+    dict entries across restarts.
+    """
+    params: dict[str, Any] = {
+        "surface": surface,
+        "pronunciation": pronunciation,
+        "accent_type": accent_type,
+    }
+    if word_type is not None:
+        params["word_type"] = word_type
+    if priority is not None:
+        params["priority"] = priority
+    with _client() as client:
+        response = client.post("/user_dict_word", params=params)
+        response.raise_for_status()
+        # /user_dict_word returns the new word_uuid as a JSON string.
+        return {"word_uuid": response.json()}
+
+
+@mcp.tool(annotations={"destructiveHint": True})
+def voicevox_dict_remove(word_uuid: str) -> dict[str, bool]:
+    """Remove a word from the user dictionary by uuid.
+
+    Use voicevox_dict_list() to look up the uuid.
+    """
+    with _client() as client:
+        response = client.delete(f"/user_dict_word/{word_uuid}")
+        response.raise_for_status()
+    return {"removed": True}
 
 
 def main() -> None:

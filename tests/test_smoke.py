@@ -29,7 +29,7 @@ def test_module_honors_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_tools_registered() -> None:
-    """FastMCP exposes registered tools via _tool_manager; ensure all 3 are present."""
+    """FastMCP exposes registered tools via _tool_manager; ensure all are present."""
     monkey_env = dict(os.environ)
     monkey_env.pop("VOICEVOX_ENGINE_URL", None)
     import nekono_voicevox_mcp.server as srv
@@ -38,6 +38,16 @@ def test_tools_registered() -> None:
     # FastMCP keeps tools on a _tool_manager. The internal API isn't stable, but
     # any path that surfaces tool names will do — fall back to introspecting the
     # module for decorated callables if needed.
-    tool_names = {"voicevox_list_speakers", "voicevox_synthesize", "voicevox_play"}
+    tool_names = {
+        "voicevox_list_speakers",
+        "voicevox_synthesize",
+        "voicevox_play",
+        "voicevox_synthesize_multi",
+        "voicevox_audio_query",
+        "voicevox_synthesize_from_query",
+        "voicevox_dict_list",
+        "voicevox_dict_add",
+        "voicevox_dict_remove",
+    }
     for name in tool_names:
         assert hasattr(srv, name), f"missing tool: {name}"
