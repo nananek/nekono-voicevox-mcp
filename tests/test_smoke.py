@@ -43,6 +43,11 @@ def test_tools_registered() -> None:
         "voicevox_synthesize",
         "voicevox_play",
         "voicevox_synthesize_multi",
+        "voicevox_audio_query",
+        "voicevox_synthesize_from_query",
+        "voicevox_dict_list",
+        "voicevox_dict_add",
+        "voicevox_dict_remove",
     }
     for name in tool_names:
         assert hasattr(srv, name), f"missing tool: {name}"
